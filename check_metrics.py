@@ -1,6 +1,6 @@
 import torch
 from unet import UNet
-from evaluate import evaluate
+from evaluate_test import evaluate
 from utils.data_loading import BasicDataset
 from torch.utils.data import DataLoader
 
