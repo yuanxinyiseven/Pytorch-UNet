@@ -11,21 +11,30 @@ from os.path import splitext, isfile, join
 from pathlib import Path
 from torch.utils.data import Dataset
 from tqdm import tqdm
+import rasterio
 
 
 def load_image(filename):
     ext = splitext(filename)[1]
+
     if ext == '.npy':
-        return Image.fromarray(np.load(filename))
+        return np.load(filename)
+
     elif ext in ['.pt', '.pth']:
-        return Image.fromarray(torch.load(filename).numpy())
-    else:
-        return Image.open(filename)
+        return torch.load(filename).numpy()
+
+    else:  # TIFF / GeoTIFF
+        with rasterio.open(filename) as ds:
+            img = ds.read()   # (C, H, W)
+        return img
+
 
 
 def unique_mask_values(idx, mask_dir, mask_suffix):
     mask_file = list(mask_dir.glob(idx + mask_suffix + '.*'))[0]
-    mask = np.asarray(load_image(mask_file))
+    mask = load_image(mask_file)
+    if mask.ndim == 3:
+        mask = mask[0]  # 只取第 1 波段
     if mask.ndim == 2:
         return np.unique(mask)
     elif mask.ndim == 3:
@@ -62,32 +71,18 @@ class BasicDataset(Dataset):
         return len(self.ids)
 
     @staticmethod
-    def preprocess(mask_values, pil_img, scale, is_mask):
-        w, h = pil_img.size
-        newW, newH = int(scale * w), int(scale * h)
-        assert newW > 0 and newH > 0, 'Scale is too small, resized images would have no pixel'
-        pil_img = pil_img.resize((newW, newH), resample=Image.NEAREST if is_mask else Image.BICUBIC)
-        img = np.asarray(pil_img)
-
+    def preprocess(img, is_mask):
         if is_mask:
-            mask = np.zeros((newH, newW), dtype=np.int64)
-            for i, v in enumerate(mask_values):
-                if img.ndim == 2:
-                    mask[img == v] = i
-                else:
-                    mask[(img == v).all(-1)] = i
-
-            return mask
-
+            if img.ndim == 3:
+                img = img[0]
+            return img.astype(np.int64)
         else:
-            if img.ndim == 2:
-                img = img[np.newaxis, ...]
-            else:
-                img = img.transpose((2, 0, 1))
-
-            if (img > 1).any():
-                img = img / 255.0
-
+            img = img.astype(np.float32)
+            # 如果是 0-255 范围，建议先归一化
+            if img.max() > 1:
+                img /= 255.0
+            # 标准化
+            img = (img - img.mean()) / (img.std() + 1e-6)
             return img
 
     def __getitem__(self, idx):
@@ -100,11 +95,24 @@ class BasicDataset(Dataset):
         mask = load_image(mask_file[0])
         img = load_image(img_file[0])
 
-        assert img.size == mask.size, \
+        # 如果是 rasterio 加载的，形状通常是 (C, H, W)
+        if img.ndim == 3:
+            if img.shape[0] == 4:  # 如果是 4 通道 (RGBA 或多光谱)
+                img = img[:3, :, :]  # 只取前 3 个通道 (RGB)
+            elif img.shape[0] == 1:  # 如果是单通道 (灰度)
+                img = np.concatenate([img] * 3, axis=0)  # 广播成 3 通道
+        # 如果是 PIL 或其他方式加载的 (H, W, C)
+        elif img.ndim == 2:
+            img = np.stack([img] * 3, axis=0)
+
+        # 确保最终形状是 (3, H, W) 供后续使用
+        # ------------------------------
+
+        assert img.shape[-2:] == mask.shape[-2:], \
             f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
 
-        img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
-        mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
+        img = self.preprocess(img, is_mask=False)
+        mask = self.preprocess(mask, is_mask=True)
 
         return {
             'image': torch.as_tensor(img.copy()).float().contiguous(),
