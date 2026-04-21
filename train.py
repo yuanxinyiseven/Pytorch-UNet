@@ -19,43 +19,50 @@ from unet import UNet
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
 
-dir_img = Path('./data/imgs/')
-dir_mask = Path('./data/masks/')
+dir_train_img = Path('./data/train/imgs/')
+dir_train_mask = Path('./data/train/masks/')
+dir_test_img = Path('./data/test/imgs/')
+dir_test_mask = Path('./data/test/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
 
 def train_model(
         model,
         device,
-        epochs: int = 5,
-        batch_size: int = 1,
-        learning_rate: float = 1e-5,
-        val_percent: float = 0.1,
+        epochs: int = 50,
+        batch_size: int = 4,
+        learning_rate: float = 1e-4,
+        val_percent: float = 0.3,
         save_checkpoint: bool = True,
-        img_scale: float = 0.5,
+        img_scale: float = 1.0,
         amp: bool = False,
         weight_decay: float = 1e-8,
-        momentum: float = 0.999,
+        momentum: float = 0.9,
         gradient_clipping: float = 1.0,
 ):
-    # 1. Create dataset
+    # 1. Create datasets (分别加载训练集和验证集)
     try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
-    except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+        train_set = CarvanaDataset(dir_train_img, dir_train_mask, img_scale)
+        val_set = CarvanaDataset(dir_test_img, dir_test_mask, img_scale)
+    except (RuntimeError, IndexError):
+        train_set = BasicDataset(dir_train_img, dir_train_mask, img_scale)
+        val_set = BasicDataset(dir_test_img, dir_test_mask, img_scale)
 
-    # 2. Split into train / validation partitions
-    n_val = int(len(dataset) * val_percent)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
+    # 2. Split 逻辑移除
+    # 原本的 n_val, n_train 和 random_split 这一段全部删掉
+    n_train = len(train_set)
+    n_val = len(val_set)
 
     # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
+    loader_args = dict(batch_size=batch_size, num_workers=2, pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
     # (Initialize logging)
     experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
+    # 显式定义 validation Dice 为一个度量指标，并以 step 作为 x 轴
+    experiment.define_metric("validation Dice", step_metric="step", summary="max")
+    experiment.define_metric("train loss", step_metric="step", summary="min")
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
              val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
@@ -74,9 +81,20 @@ def train_model(
     ''')
 
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.RMSprop(model.parameters(),
-                              lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
+    optimizer = optim.AdamW(model.parameters(),
+                            lr=learning_rate,
+                            weight_decay=1e-4,  # 适当的权重衰减防止过拟合
+                            amsgrad=True)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    # --- 修改后的 scheduler 定义 ---
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='max',  # 监控指标（Dice）越大越好
+        patience=10,  # 【修改这里】耐心值，建议从 3 改为 5 或 7
+        factor=0.2,  # 【新增这里】学习率衰减倍数，从默认 0.1 改为 0.5（下降更温和）
+        threshold=1e-3,  # 【新增这里】提升阈值，只有超过这个增量才算进步
+        # verbose=True  # 【建议新增】这样你可以在控制台看到学习率下降的提示
+    )  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
@@ -120,11 +138,7 @@ def train_model(
                 pbar.update(images.shape[0])
                 global_step += 1
                 epoch_loss += loss.item()
-                experiment.log({
-                    'train loss': loss.item(),
-                    'step': global_step,
-                    'epoch': epoch
-                })
+                experiment.log({"train loss": loss.item(), 'step': global_step, 'epoch': epoch})
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
 
                 # Evaluation round
@@ -139,39 +153,41 @@ def train_model(
                             if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
                                 histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
 
+                        # 找到 Evaluation round 里的 experiment.log 部分，修改为：
+                        # --- 在 train_model 函数中找到 Evaluation round 部分 ---
+
+                        # 1. 运行验证函数获取分数
                         val_score = evaluate(model, val_loader, device, amp)
                         scheduler.step(val_score)
 
-                        logging.info('Validation Dice score: {}'.format(val_score))
-                        try:
-                            experiment.log({
-                                'learning rate': optimizer.param_groups[0]['lr'],
-                                'validation Dice': val_score,
-                                'images': wandb.Image(images[0].cpu()),
-                                'masks': {
-                                    'true': wandb.Image(true_masks[0].float().cpu()),
-                                    'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
-                                },
-                                'step': global_step,
-                                'epoch': epoch,
-                                **histograms
-                            })
-                        except:
-                            pass
+                        logging.info(f'Validation Dice score: {val_score}')
+
+                        # 2. 【核心修改】只上传纯数值指标，彻底移除 wandb.Image
+                        # 只要不传图像，就不会触发 [12, 128, 128] 的报错
+                        experiment.log({
+                            "learning rate": optimizer.param_groups[0]['lr'],
+                            "validation Dice": val_score,  # 这是你想要的纵轴变量
+                            "step": global_step,  # 这是你想要的横轴变量
+                            "epoch": epoch
+                        })
+
+                        # 如果你还是想看直方图，可以保留这一句（直方图通常不会因为通道数报错）
+                        if histograms:
+                            experiment.log({**histograms, "step": global_step})
 
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
-            state_dict['mask_values'] = dataset.mask_values
+            state_dict['mask_values'] = val_set.mask_values
             torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
             logging.info(f'Checkpoint {epoch} saved!')
 
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=5, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
-    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
+    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=50, help='Number of epochs')
+    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=4, help='Batch size')
+    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-4,
                         help='Learning rate', dest='lr')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
@@ -179,7 +195,7 @@ def get_args():
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--classes', '-c', type=int, default=4, help='Number of classes')
 
     return parser.parse_args()
 
