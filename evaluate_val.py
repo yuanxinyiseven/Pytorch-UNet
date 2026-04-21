@@ -6,7 +6,7 @@ from utils.dice_score import multiclass_dice_coeff, dice_coeff
 
 
 @torch.inference_mode()
-def evaluate(net, dataloader, device, amp):
+def evaluate_val(net, dataloader, device, amp):
     net.eval()
     num_val_batches = len(dataloader)
     dice_score = 0
