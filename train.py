@@ -28,12 +28,13 @@ dir_val_mask = Path('./data/val/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
 
-def plot_training_history(train_losses, val_accuracies, epochs_list):
+def plot_training_history(train_losses, val_losses, train_accuracies, val_accuracies, epochs_list):
     """绘制训练损失和验证精度曲线"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     
     # 绘制损失曲线
-    ax1.plot(epochs_list, train_losses, 'b-', linewidth=2, label='Training Loss')
+    ax1.plot(epochs_list, train_losses, 'b-', linewidth=2, label='Training Loss', marker='o')
+    ax1.plot(epochs_list, val_losses, 'orange', linewidth=2, label='Validation Loss', marker='s')
     ax1.set_xlabel('Epochs', fontsize=12)
     ax1.set_ylabel('Loss', fontsize=12)
     ax1.set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
@@ -41,7 +42,8 @@ def plot_training_history(train_losses, val_accuracies, epochs_list):
     ax1.grid(True, alpha=0.3)
     
     # 绘制精度曲线
-    ax2.plot(epochs_list, val_accuracies, 'orange', linewidth=2, label='Validation Accuracy (Dice)')
+    ax2.plot(epochs_list, train_accuracies, 'b-', linewidth=2, label='Training Accuracy', marker='o')
+    ax2.plot(epochs_list, val_accuracies, 'orange', linewidth=2, label='Validation Accuracy', marker='s')
     ax2.set_xlabel('Epochs', fontsize=12)
     ax2.set_ylabel('Accuracy', fontsize=12)
     ax2.set_title('Training and Validation Accuracy', fontsize=14, fontweight='bold')
@@ -141,7 +143,7 @@ def train_model(
         model.train()
         epoch_loss = 0
         epoch_accuracy = 0
-        num_train_batches = 0
+        num_train_batches = len(train_loader)
         previous_step = global_step
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
@@ -217,12 +219,13 @@ def train_model(
                         if histograms:
                             experiment.log({**histograms, "step": global_step})
         # 在每个epoch结束时，计算并记录平均训练loss和验证指标
-        avg_epoch_loss = epoch_loss / num_train_batches
+        avg_epoch_loss = epoch_loss / num_train_batches if num_train_batches > 0 else 0
         train_losses.append(avg_epoch_loss)
         
         # 计算该epoch的验证损失和精度
         val_loss = 0
         val_accuracy = 0
+        num_val_batches = 0
         model.eval()
         with torch.no_grad():
             for batch in val_loader:
@@ -243,20 +246,27 @@ def train_model(
                             multiclass=True
                         )
                 val_loss += batch_loss.item()
+                num_train_batches += 1
+                num_val_batches += 1
+
+        avg_val_loss = val_loss / num_val_batches if num_val_batches > 0 else 0
+        val_losses.append(avg_val_loss)
         
-        # 通过evaluate函数获取验证精度
+        # 3. 计算验证精度（Dice分数）
         val_accuracy = evaluate_val(model, val_loader, device, amp)
         val_accuracy = val_accuracy.cpu().item() if isinstance(val_accuracy, torch.Tensor) else val_accuracy
-        
-        avg_val_loss = val_loss / len(val_loader)
-        val_losses.append(avg_val_loss)
         val_accuracies.append(val_accuracy)
-        epochs_list.append(epoch)
-        
-        # 计算训练精度（使用evaluate函数在训练集上）
+
+        # 4. 计算训练精度（Dice分数）
         train_accuracy = evaluate_val(model, train_loader, device, amp)
         train_accuracy = train_accuracy.cpu().item() if isinstance(train_accuracy, torch.Tensor) else train_accuracy
         train_accuracies.append(train_accuracy)
+
+        # 5. 记录 epoch 编号
+        epochs_list.append(epoch)
+
+        logging.info(f'Epoch {epoch} - Train Loss: {avg_epoch_loss:.4f}, Val Loss: {avg_val_loss:.4f}, '
+                     f'Train Accuracy: {train_accuracy:.4f}, Val Accuracy: {val_accuracy:.4f}')
 
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
@@ -265,12 +275,12 @@ def train_model(
             torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
             logging.info(f'Checkpoint {epoch} saved!')
     # 训练完成后绘制图表
-    plot_training_history(train_losses, val_accuracies, epochs_list)
+    plot_training_history(train_losses, val_losses, train_accuracies, val_accuracies, epochs_list)
 
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=3, help='Number of epochs')
+    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=2, help='Number of epochs')
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=4, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-4,
                         help='Learning rate', dest='lr')
