@@ -1,6 +1,6 @@
 import torch
 from unet import UNet
-from evaluate_test import evaluate
+from evaluate_test import evaluate_test
 from utils.data_loading import BasicDataset
 from torch.utils.data import DataLoader
 
@@ -24,7 +24,7 @@ def main():
     val_loader = DataLoader(val_set, batch_size=4, shuffle=False, num_workers=0)
 
     # 3. 运行评估
-    results = evaluate(net, val_loader, device, amp=True)
+    results = evaluate_test(net, val_loader, device, amp=True)
 
     # 4. 打印格式化结果
     class_names = ['Unchanged', 'Logging', 'Fire', 'Non-Forest']
