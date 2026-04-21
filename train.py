@@ -21,8 +21,8 @@ from utils.dice_score import dice_loss
 
 dir_train_img = Path('./data/train/imgs/')
 dir_train_mask = Path('./data/train/masks/')
-dir_test_img = Path('./data/test/imgs/')
-dir_test_mask = Path('./data/test/masks/')
+dir_val_img = Path('./data/val/imgs/')
+dir_val_mask = Path('./data/val/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
 
@@ -43,10 +43,10 @@ def train_model(
     # 1. Create datasets (分别加载训练集和验证集)
     try:
         train_set = CarvanaDataset(dir_train_img, dir_train_mask, img_scale)
-        val_set = CarvanaDataset(dir_test_img, dir_test_mask, img_scale)
+        val_set = CarvanaDataset(dir_val_img, dir_val_mask, img_scale)
     except (RuntimeError, IndexError):
         train_set = BasicDataset(dir_train_img, dir_train_mask, img_scale)
-        val_set = BasicDataset(dir_test_img, dir_test_mask, img_scale)
+        val_set = BasicDataset(dir_val_img, dir_val_mask, img_scale)
 
     # 2. Split 逻辑移除
     # 原本的 n_val, n_train 和 random_split 这一段全部删掉
