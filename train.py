@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 import random
 import sys
 import torch
@@ -21,12 +22,9 @@ from unet import UNet
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
 
-dir_train_img = Path('./data/train/imgs/')
-dir_train_mask = Path('./data/train/masks/')
-dir_val_img = Path('./data/val/imgs/')
-dir_val_mask = Path('./data/val/masks/')
-dir_checkpoint = Path('./checkpoints/')
-
+dir_img = Path(r'D:\projects\2026\graduation_project\U-Net模型训练与构建\Pytorch-UNet-master\Pytorch-UNet-master\data\imgs')
+dir_mask = Path(r'D:\projects\2026\graduation_project\U-Net模型训练与构建\Pytorch-UNet-master\Pytorch-UNet-master\data\masks')
+dir_checkpoint = Path(r'D:\projects\2026\graduation_project\U-Net模型训练与构建\Pytorch-UNet-master\Pytorch-UNet-master\checkpoints')
 
 def plot_training_history(train_losses, val_losses, train_accuracies, val_accuracies, epochs_list):
     """绘制训练损失和验证精度曲线"""
@@ -58,35 +56,53 @@ def plot_training_history(train_losses, val_losses, train_accuracies, val_accura
     logging.info(f'Training history plot saved to {output_path}')
     plt.close()
 
+
 def train_model(
         model,
         device,
-        epochs: int = 3,
+        epochs: int = 50,
         batch_size: int = 4,
         learning_rate: float = 1e-4,
         val_percent: float = 0.3,
         save_checkpoint: bool = True,
-        img_scale: float = 1.0,
+        img_scale: float = 0.5,
         amp: bool = False,
         weight_decay: float = 1e-8,
         momentum: float = 0.9,
         gradient_clipping: float = 1.0,
 ):
-    # 1. Create datasets (分别加载训练集和验证集)
+    # 1. Create dataset，定义dataset变量
     try:
-        train_set = CarvanaDataset(dir_train_img, dir_train_mask, img_scale)
-        val_set = CarvanaDataset(dir_val_img, dir_val_mask, img_scale)
-    except (RuntimeError, IndexError):
-        train_set = BasicDataset(dir_train_img, dir_train_mask, img_scale)
-        val_set = BasicDataset(dir_val_img, dir_val_mask, img_scale)
+        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
+    except (AssertionError, RuntimeError, IndexError):
+        dataset = BasicDataset(dir_img, dir_mask, img_scale)
 
-    # 2. Split 逻辑移除
-    # 原本的 n_val, n_train 和 random_split 这一段全部删掉
-    n_train = len(train_set)
-    n_val = len(val_set)
+    # 2. Split into train / validation partitions
+    n_val = int(len(dataset) * val_percent)
+    n_train = len(dataset) - n_val
+    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
+
+    try:
+        # 创建一个不带增强的全量 dataset 用于扫描 unique values 等初始化
+        temp_dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
+    except:
+        temp_dataset = BasicDataset(dir_img, dir_mask, img_scale)
+
+    all_ids = temp_dataset.ids  # 获取所有ID
+    n_val = int(len(all_ids) * val_percent)
+    n_train = len(all_ids) - n_val
+    train_ids, val_ids = random_split(all_ids, [n_train, n_val], generator=torch.Generator().manual_seed(0))
+
+    # 【核心】分别实例化训练和验证 Dataset
+    # 仅给训练集设置 augment=True
+    train_set = BasicDataset(dir_img, dir_mask, img_scale, augment=True)
+    train_set.ids = train_ids  # 手动覆盖 Subset 的 ID 逻辑
+
+    val_set = BasicDataset(dir_img, dir_mask, img_scale, augment=False)
+    val_set.ids = val_ids
 
     # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=2, pin_memory=True)
+    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
@@ -118,19 +134,20 @@ def train_model(
                             weight_decay=1e-4,  # 适当的权重衰减防止过拟合
                             amsgrad=True)
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
     # --- 修改后的 scheduler 定义 ---
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='max',  # 监控指标（Dice）越大越好
-        patience=10,  # 【修改这里】耐心值，建议从 3 改为 5 或 7
-        factor=0.2,  # 【新增这里】学习率衰减倍数，从默认 0.1 改为 0.5（下降更温和）
-        threshold=1e-3,  # 【新增这里】提升阈值，只有超过这个增量才算进步
+        patience=15,  # 【修改这里】耐心值，建议从 3 改为 5 或 7
+        factor=0.3,  # 【新增这里】学习率衰减倍数，从默认 0.1 改为 0.5（下降更温和）
+        threshold=1e-4,  # 【新增这里】提升阈值，只有超过这个增量才算进步
         # verbose=True  # 【建议新增】这样你可以在控制台看到学习率下降的提示
     )  # goal: maximize Dice score
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    grad_scaler = torch.amp.GradScaler('cuda', enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
-    
+
     # 添加这些列表来追踪每个epoch的指标
     train_losses = []      # 每个epoch的平均训练损失
     val_losses = []        # 每个epoch的验证损失
@@ -157,7 +174,7 @@ def train_model(
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
                 true_masks = true_masks.to(device=device, dtype=torch.long)
 
-                with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
+                with torch.amp.autocast('cuda', enabled=amp):
                     masks_pred = model(images)
                     if model.n_classes == 1:
                         loss = criterion(masks_pred.squeeze(1), true_masks.float())
@@ -195,16 +212,17 @@ def train_model(
                             if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
                                 histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
 
+                        # 找到 Evaluation round 里的 experiment.log 部分，修改为：
+                        # --- 在 train_model 函数中找到 Evaluation round 部分 ---
 
                         # 1. 运行验证函数获取分数
                         val_score = evaluate_val(model, val_loader, device, amp)
-                        # 将张量转换为 Python 浮点数
+                         # 将张量转换为 Python 浮点数
                         if isinstance(val_score, torch.Tensor):
                             val_score = val_score.cpu().item()
-
+                        
                         scheduler.step(val_score)
                         logging.info(f'Validation Dice score: {val_score}')
-                        
 
                         # 2. 【核心修改】只上传纯数值指标，彻底移除 wandb.Image
                         # 只要不传图像，就不会触发 [12, 128, 128] 的报错
@@ -218,10 +236,11 @@ def train_model(
                         # 如果你还是想看直方图，可以保留这一句（直方图通常不会因为通道数报错）
                         if histograms:
                             experiment.log({**histograms, "step": global_step})
+
         # 在每个epoch结束时，计算并记录平均训练loss和验证指标
         avg_epoch_loss = epoch_loss / num_train_batches if num_train_batches > 0 else 0
         train_losses.append(avg_epoch_loss)
-        
+
         # 计算该epoch的验证损失和精度
         val_loss = 0
         val_accuracy = 0
@@ -271,7 +290,7 @@ def train_model(
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
-            state_dict['mask_values'] = val_set.mask_values
+            state_dict['mask_values'] = dataset.mask_values
             torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
             logging.info(f'Checkpoint {epoch} saved!')
     # 训练完成后绘制图表
@@ -280,7 +299,7 @@ def train_model(
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=2, help='Number of epochs')
+    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=50, help='Number of epochs')
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=4, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-4,
                         help='Learning rate', dest='lr')
@@ -305,7 +324,7 @@ if __name__ == '__main__':
     # Change here to adapt to your data
     # n_channels=3 for RGB images
     # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+    model = UNet(n_channels=5, n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'
